@@ -1,17 +1,21 @@
+import os
 from gmail_client import list_recent_emails
 from summarizer import build_summary
-from whatsapp_sender import send_whatsapp_message
+from telegram_sender import send_telegram_message
 
-PHONE = "+5541991154852"
+def main():
+    print("Worker started.")
 
-print("Meu agente está rodando corretamente!")
+    # Ajuste quantos emails quer resumir
+    max_results = int(os.getenv("MAX_EMAILS", "10"))
 
-emails = list_recent_emails()
+    emails = list_recent_emails(max_results=max_results)
+    summary = build_summary(emails)
 
-summary = build_summary(emails)   # <<< AQUI o resumo nasce
+    # Envia para Telegram
+    send_telegram_message(summary)
 
-print("Enviando resumo no WhatsApp...")
+    print("Done.")
 
-send_whatsapp_message(PHONE, summary)
-
-print("Resumo enviado com sucesso!")
+if __name__ == "__main__":
+    main()
