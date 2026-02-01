@@ -1,74 +1,75 @@
-from __future__ import annotations
-from typing import List, Dict
+# gmail_client.py
 import os
-from datetime import datetime, timedelta, timezone
+import json
+from typing import List, Dict, Any
 
-from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
 
+# Ajuste seus scopes aqui (tem que bater com o token.json)
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
-def get_gmail_service():
-    creds = None
 
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+def _load_credentials_from_env() -> Credentials:
+    """
+    Carrega credenciais a partir da variável de ambiente GMAIL_TOKEN_JSON
+    (conteúdo inteiro do token.json).
+    """
+    token_json = os.environ.get("GMAIL_TOKEN_JSON")
+    if not token_json:
+        raise RuntimeError(
+            "Missing env var GMAIL_TOKEN_JSON. Put the full token.json content there."
+        )
+
+    try:
+        info = json.loads(token_json)
+    except json.JSONDecodeError as e:
+        raise RuntimeError("GMAIL_TOKEN_JSON is not valid JSON.") from e
+
+    creds = Credentials.from_authorized_user_info(info, SCOPES)
+
+    # Se expirou e tiver refresh_token, renova automaticamente
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+
+    return creds
+
+
+def get_gmail_service():
+    creds = _load_credentials_from_env()
 
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        with open("token.json", "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
+        # Se não tem refresh_token, não tem como renovar no servidor
+        if not creds.refresh_token:
+            raise RuntimeError(
+                "GMAIL_TOKEN_JSON has no refresh_token. "
+                "You must re-generate token.json with offline access."
+            )
+        raise RuntimeError("Gmail credentials invalid even after refresh attempt.")
 
     return build("gmail", "v1", credentials=creds)
 
-def _get_header(headers: List[Dict], name: str) -> str:
-    for h in headers:
-        if h.get("name", "").lower() == name.lower():
-            return h.get("value", "")
-    return ""
 
-def list_recent_emails(hours_back: int = 6, max_results: int = 10) -> List[Dict]:
+def list_recent_emails(max_results: int = 5) -> List[Dict[str, Any]]:
     service = get_gmail_service()
 
-    now_utc = datetime.now(timezone.utc)
-    after = now_utc - timedelta(hours=hours_back)
-    after_unix = int(after.timestamp())
+    results = service.users().messages().list(userId="me", maxResults=max_results).execute()
+    messages = results.get("messages", [])
 
-    query = f"after:{after_unix} -category:promotions -category:social"
-
-    resp = service.users().messages().list(
-        userId="me",
-        q=query,
-        maxResults=max_results
-    ).execute()
-
-    msgs = resp.get("messages", [])
     emails = []
+    for m in messages:
+        msg = service.users().messages().get(userId="me", id=m["id"], format="metadata").execute()
+        headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
 
-    for m in msgs:
-        msg = service.users().messages().get(
-            userId="me",
-            id=m["id"],
-            format="metadata",
-            metadataHeaders=["From", "Subject", "Date"]
-        ).execute()
-
-        payload = msg.get("payload", {})
-        headers = payload.get("headers", [])
-
-        emails.append({
-            "id": m["id"],
-            "date": _get_header(headers, "Date"),
-            "from": _get_header(headers, "From"),
-            "subject": _get_header(headers, "Subject"),
-            "snippet": msg.get("snippet", ""),
-        })
+        emails.append(
+            {
+                "id": msg.get("id"),
+                "threadId": msg.get("threadId"),
+                "subject": headers.get("Subject", ""),
+                "from": headers.get("From", ""),
+                "date": headers.get("Date", ""),
+            }
+        )
 
     return emails
