@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 MAX_LOW_PRIORITY = 8
 
@@ -42,35 +42,46 @@ PROMO_KEYWORDS = [
     "sale",
 ]
 
+
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
+
 
 def _safe_subject(e: Dict[str, Any]) -> str:
     return _norm(e.get("subject") or e.get("Subject") or "")
 
+
 def _safe_from(e: Dict[str, Any]) -> str:
     return _norm(e.get("from") or e.get("From") or "")
+
 
 def _safe_snippet(e: Dict[str, Any]) -> str:
     return _norm(e.get("snippet") or e.get("snippetText") or e.get("preview") or "")
 
+
 def _compact_key(subject: str, sender: str) -> str:
+    """
+    Chave agressiva para agrupar alertas repetidos (remove números/ids variáveis).
+    """
     base = f"{subject}||{sender}".lower()
-    base = re.sub(r"\b[a-f0-9]{6,}\b", "<hash>", base)
-    base = re.sub(r"\b\d{4,}\b", "<num>", base)
-    return base.strip()
+    base = re.sub(r"\b[a-f0-9]{6,}\b", "<hash>", base)  # hashes/commits
+    base = re.sub(r"\b\d+\b", "<num>", base)            # qualquer número
+    base = re.sub(r"\s+", " ", base).strip()
+    return base
+
 
 def _is_google_alert(sender: str, subject: str) -> bool:
     t = f"{sender} {subject}".lower()
     return "google alerts" in t or "alerta do google" in t
 
+
 def _is_recovery(subject: str, snippet: str) -> bool:
     t = f"{subject} {snippet}".lower()
     return any(k in t for k in RECOVERY_KEYWORDS)
 
+
 def _looks_like_incident(subject: str, sender: str, snippet: str) -> bool:
     text = f"{subject} {sender} {snippet}".lower()
-
     is_infra_sender = any(s in text for s in INFRA_SENDERS)
 
     # "alert" genérico (ex.: Google Alerts) não é incidente
@@ -78,6 +89,7 @@ def _looks_like_incident(subject: str, sender: str, snippet: str) -> bool:
         return False
 
     return any(k in text for k in INCIDENT_KEYWORDS)
+
 
 def _priority_bucket(subject: str, sender: str, snippet: str) -> str:
     if _is_google_alert(sender, subject):
@@ -95,45 +107,50 @@ def _priority_bucket(subject: str, sender: str, snippet: str) -> str:
 
     return "BAIXA"
 
+
 def _one_line(subject: str, snippet: str) -> str:
     return (_norm(snippet)[:140] if snippet else subject)
 
+
 def _urgency_score(subject: str, sender: str, snippet: str, count: int) -> int:
     """
-    Score 0–100 (heurístico, mas consistente).
+    Score 0–100 (heurístico, consistente e ajustável).
     """
     text = f"{subject} {sender} {snippet}".lower()
-
     score = 0
 
-    # base por categoria
+    # Base por categoria
     if _looks_like_incident(subject, sender, snippet):
         score += 55
+
+    # Recuperado => menos urgente
     if _is_recovery(subject, snippet):
-        score -= 25  # recuperado = menos urgente
+        score -= 25
+
+    # Google Alert => informativo, mas não emergência
     if _is_google_alert(sender, subject):
         score += 25
+
+    # Promos/newsletters
     if any(k in text for k in PROMO_KEYWORDS):
         score += 5
 
-    # sinalizadores fortes
+    # Sinais fortes
     strong = ["server failure detected", "deployment crashed", "crashed", "outage", "down", "exited with status"]
     if any(k in text for k in strong):
         score += 20
 
-    # remetente "infra" pesa mais
+    # Remetente infra
     if any(s in text for s in INFRA_SENDERS):
         score += 10
 
-    # repetição: 3 alertas iguais é mais importante que 1
+    # Repetição (flapping)
     score += min(15, (count - 1) * 5)
 
-    # clamp
-    if score < 0:
-        score = 0
-    if score > 100:
-        score = 100
+    # Clamp
+    score = max(0, min(100, score))
     return int(score)
+
 
 def build_items(emails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -153,7 +170,13 @@ def build_items(emails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         key = _compact_key(subject, sender)
 
         if key not in grouped:
-            grouped[key] = {"key": key, "subject": subject, "from": sender, "snippet": snippet, "count": 1}
+            grouped[key] = {
+                "key": key,
+                "subject": subject,
+                "from": sender,
+                "snippet": snippet,
+                "count": 1,
+            }
         else:
             grouped[key]["count"] += 1
             if len(snippet) > len(grouped[key]["snippet"]):
@@ -165,9 +188,9 @@ def build_items(emails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         it["bucket"] = _priority_bucket(it["subject"], it["from"], it["snippet"])
         it["score"] = _urgency_score(it["subject"], it["from"], it["snippet"], it["count"])
 
-    # ordena: maior score primeiro
     items.sort(key=lambda x: x["score"], reverse=True)
     return items
+
 
 def build_summary_from_items(items: List[Dict[str, Any]]) -> str:
     if not items:
@@ -175,9 +198,9 @@ def build_summary_from_items(items: List[Dict[str, Any]]) -> str:
 
     high, medium, low = [], [], []
     for it in items:
-        if it["bucket"] == "ALTA":
+        if it.get("bucket") == "ALTA":
             high.append(it)
-        elif it["bucket"] == "MEDIA":
+        elif it.get("bucket") == "MEDIA":
             medium.append(it)
         else:
             low.append(it)
@@ -190,7 +213,10 @@ def build_summary_from_items(items: List[Dict[str, Any]]) -> str:
                 "Tentar restart/redeploy; se persistir, analisar stack trace.",
             ]
         if bucket == "MEDIA":
-            return ["Ler o conteúdo e decidir encaminhamento/ação.", "Se for recorrente, criar filtro/label no Gmail."]
+            return [
+                "Ler o conteúdo e decidir encaminhamento/ação.",
+                "Se for recorrente, criar filtro/label no Gmail.",
+            ]
         return ["Arquivar ou mover para newsletters/promos."]
 
     lines: List[str] = []
@@ -198,9 +224,9 @@ def build_summary_from_items(items: List[Dict[str, Any]]) -> str:
     if high:
         lines.append("Emails com prioridade ALTA\n")
         for i, it in enumerate(high, 1):
-            tag = f"(recebido {it['count']}x)" if it["count"] > 1 else ""
-            lines.append(f"{i}) [{it['score']}/100] {it['subject']} {tag}".strip())
-            lines.append(f"- Resumo (1 linha): {_one_line(it['subject'], it['snippet'])}")
+            tag = f"(recebido {it['count']}x)" if it.get("count", 1) > 1 else ""
+            lines.append(f"{i}) [{it.get('score', 0)}/100] {it.get('subject', '')} {tag}".strip())
+            lines.append(f"- Resumo (1 linha): {_one_line(it.get('subject',''), it.get('snippet',''))}")
             lines.append("- Ações práticas:")
             for a in actions("ALTA"):
                 lines.append(f"  - {a}")
@@ -209,9 +235,9 @@ def build_summary_from_items(items: List[Dict[str, Any]]) -> str:
     if medium:
         lines.append("Emails com prioridade MÉDIA\n")
         for i, it in enumerate(medium, 1):
-            tag = f"(recebido {it['count']}x)" if it["count"] > 1 else ""
-            lines.append(f"{i}) [{it['score']}/100] {it['subject']} {tag}".strip())
-            lines.append(f"- Resumo (1 linha): {_one_line(it['subject'], it['snippet'])}")
+            tag = f"(recebido {it['count']}x)" if it.get("count", 1) > 1 else ""
+            lines.append(f"{i}) [{it.get('score', 0)}/100] {it.get('subject', '')} {tag}".strip())
+            lines.append(f"- Resumo (1 linha): {_one_line(it.get('subject',''), it.get('snippet',''))}")
             lines.append("- Ações sugeridas:")
             for a in actions("MEDIA"):
                 lines.append(f"  - {a}")
@@ -220,9 +246,9 @@ def build_summary_from_items(items: List[Dict[str, Any]]) -> str:
     if low:
         lines.append("Emails de BAIXA prioridade (ação opcional)\n")
         for it in low[:MAX_LOW_PRIORITY]:
-            tag = f"(recebido {it['count']}x)" if it["count"] > 1 else ""
-            lines.append(f"- [{it['score']}/100] {it['subject']} {tag}".strip())
-            lines.append(f"  - Resumo: {_one_line(it['subject'], it['snippet'])}")
+            tag = f"(recebido {it['count']}x)" if it.get("count", 1) > 1 else ""
+            lines.append(f"- [{it.get('score', 0)}/100] {it.get('subject', '')} {tag}".strip())
+            lines.append(f"  - Resumo: {_one_line(it.get('subject',''), it.get('snippet',''))}")
 
         if len(low) > MAX_LOW_PRIORITY:
             lines.append(f"\n(+ {len(low) - MAX_LOW_PRIORITY} emails omitidos)")
