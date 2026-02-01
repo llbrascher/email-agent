@@ -15,7 +15,7 @@ def build_summary(emails: List[Dict]) -> str:
         text += (
             f"FROM: {e['from']}\n"
             f"SUBJECT: {e['subject']}\n"
-            f"SNIPPET: {e['snippet']}\n\n"
+            f"SNIPPET: {e.get('snippet', '')}\n\n"
         )
 
     prompt = f"""
