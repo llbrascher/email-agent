@@ -1,298 +1,93 @@
-from __future__ import annotations
-
-import json
-import os
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import List, Dict, Any
 
 
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-MAX_EMAILS_TO_SEND = int(os.getenv("MAX_EMAILS_TO_SEND", "40"))
-
-
-# ==========
-# Heurísticas locais (antes do LLM)
-# ==========
-
-TECH_ALERT_KEYWORDS = [
-    "render", "railway", "deployment", "crashed", "server failure", "incident", "downtime",
-    "uptime", "statuspage", "monitoring", "error rate", "latency",
-    "kubernetes", "pod", "container", "healthcheck", "cpu", "memory",
-]
-TECH_SENDER_PATTERNS = [
-    r"@render\.com",
-    r"@railway\.app",
-    r"@statuspage\.io",
-    r"@pagerduty\.com",
-    r"@datadoghq\.com",
-    r"@uptimerobot\.com",
-    r"@sentry\.io",
-]
-
-HIGH_INTENT_KEYWORDS = [
-    # banco / pagamentos / cobranças / prazos
-    "banco", "itau", "itaú", "bradesco", "santander", "nubank", "caixa", "bb", "banco do brasil",
-    "boleto", "fatura", "cobrança", "cobranca", "pagamento", "venc", "vence", "vencimento",
-    "atraso", "pendente", "débito", "debito", "inadimpl", "juros", "multa", "pix",
-    "cartão", "cartao", "estorno", "reembolso", "chargeback", "comprovante", "extrato",
-    "renovação", "renovacao", "assinatura", "plano",
-    "iptu", "ipva", "condomínio", "condominio", "aluguel", "energia", "luz", "água", "agua",
-    "internet", "telefone", "plano de saúde", "plano de saude",
-    # escola
-    "escola", "colégio", "colegio", "mensalidade", "rematrícula", "rematricula",
-    "matrícula", "matricula", "boletim", "prova", "reunião", "reuniao", "material",
-    # compras (pode envolver cobrança/prazo)
-    "pedido confirmado", "pedido", "compra", "nota fiscal", "entrega", "rastreio", "rastreamento",
-    # “associação/cadastro falhou” pode ser dinheiro/serviço
-    "associação", "associacao", "não foi realizada", "nao foi realizada", "recusado", "recusada",
+# Palavras/assuntos que você quer priorizar
+HIGH_INTENT_PATTERNS = [
+    r"\bvenc(e|imento|er)\b",
+    r"\bvence\b",
+    r"\bbolet(o|os)\b",
+    r"\bfatura\b",
+    r"\bcobran(ç|c)a\b",
+    r"\bpagamento\b",
+    r"\brenova(ç|c)ão\b",
+    r"\bmensalidade\b",
+    r"\bmatr[ií]cula\b",
+    r"\bescola\b",
+    r"\brematr[ií]cula\b",
+    r"\bprova\b",
+    r"\bmaterial\b",
+    r"\bnota fiscal\b",
+    r"\brecibo\b",
+    r"\bimposto\b",
+    r"\birpf\b",
+    r"\bseguro\b",
+    r"\bassinatura\b",
+    r"\brenova\b",
+    r"\bsuspens(a|ão)\b",
+    r"\bbanco\b",
+    r"\bcart[aã]o\b",
+    r"\bconta\b",
+    r"\bpix\b",
+    r"\btransfer[eê]ncia\b",
 ]
 
-LOW_LIKELY_TOPICS = [
-    # promo/newsletter/social
-    "newsletter", "promo", "desconto", "oferta", "últimas horas", "ultima chance", "final call",
-    "tiktok", "strava", "vans",
+# Remover ruído de alertas técnicos (devops / serviços)
+TECH_ALERT_PATTERNS = [
+    r"\brender\b",
+    r"\brailway\b",
+    r"\bdeployment\b",
+    r"\bcrash\b",
+    r"\bserver failure\b",
+    r"\binstance failed\b",
+    r"\berror\b",
+    r"\bexception\b",
+    r"\blog\b",
+    r"\bstatuspage\b",
 ]
 
 
-def build_summary(emails: List[Dict[str, Any]]) -> str:
-    normalized = [_normalize_email(e) for e in (emails or [])][:MAX_EMAILS_TO_SEND]
-    if not normalized:
-        return "Nenhum email encontrado."
-
-    for e in normalized:
-        e["_tech_alert"] = _looks_like_tech_alert(e)
-
-    # Tenta LLM (com tom humano)
-    items = _classify_with_llm(normalized)
-    if items:
-        return _format_summary(items)
-
-    # Fallback (sem LLM)
-    items_fb = [_fallback_item(e) for e in normalized]
-    return _format_summary(items_fb)
+def _safe(s: Any) -> str:
+    return (s or "").strip()
 
 
-def _normalize_email(e: Dict[str, Any]) -> Dict[str, Any]:
-    subject = (e.get("subject") or "").strip() or "(sem assunto)"
-    sender = (e.get("from") or e.get("sender") or "").strip() or "(remetente desconhecido)"
-    snippet = (e.get("snippet") or e.get("body") or "").strip()
-
-    dt = e.get("date") or e.get("internalDate") or e.get("internal_date")
-    iso_date = _to_iso(dt)
-
-    return {
-        "id": e.get("id") or "",
-        "subject": subject,
-        "from": sender,
-        "snippet": snippet[:800],
-        "date": iso_date,
-    }
+def _looks_like_tech_alert(text: str) -> bool:
+    t = text.lower()
+    return any(re.search(p, t) for p in TECH_ALERT_PATTERNS)
 
 
-def _to_iso(dt: Any) -> str:
-    try:
-        if dt is None:
-            return ""
-        if isinstance(dt, (int, float)):
-            if dt > 10_000_000_000:  # ms
-                dt = dt / 1000.0
-            return datetime.fromtimestamp(dt).isoformat()
-        if isinstance(dt, str):
-            return dt
-    except Exception:
-        pass
-    return ""
+def _intent_score(subject: str, sender: str, snippet: str) -> int:
+    hay = f"{subject}\n{sender}\n{snippet}".lower()
+
+    score = 0
+
+    # Penaliza alertas técnicos
+    if _looks_like_tech_alert(hay):
+        score -= 35
+
+    # Dá peso alto para “assuntos da vida real”
+    for p in HIGH_INTENT_PATTERNS:
+        if re.search(p, hay):
+            score += 18
+
+    # Heurísticas extras
+    if any(w in hay for w in ["urgente", "importante", "ação necessária", "prazo", "último dia", "final call"]):
+        score += 12
+
+    # Promoções/newsletters: costuma ser baixo
+    if any(w in hay for w in ["off", "promo", "desconto", "newsletter", "oferta", "sale", "black friday"]):
+        score -= 10
+
+    # Clamps
+    if score < 0:
+        score = 0
+    if score > 100:
+        score = 100
+    return score
 
 
-def _looks_like_tech_alert(e: Dict[str, Any]) -> bool:
-    sender = (e.get("from") or "").lower()
-    text = f"{e.get('subject','')} {e.get('from','')} {e.get('snippet','')}".lower()
-
-    for pat in TECH_SENDER_PATTERNS:
-        if re.search(pat, sender):
-            return True
-
-    return any(kw in text for kw in TECH_ALERT_KEYWORDS)
-
-
-# ==========
-# LLM
-# ==========
-
-def _classify_with_llm(emails: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
-
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception:
-        return None
-
-    client = OpenAI(api_key=api_key)
-
-    system_prompt = (
-        "Você é um assistente humano do Leandro, responsável por triagem de emails.\n"
-        "TOM: escreva de forma natural, direta e útil — como um assistente pessoal.\n"
-        "Sem linguagem robótica. Nada de 'sem sinais fortes'.\n\n"
-        "OBJETIVO: priorizar banco/contas/escola/prazos. Alertas técnicos não importam.\n\n"
-        "REGRAS FORTES:\n"
-        "1) Se o email for alerta técnico (Render/Railway/deployment/incident/status/monitoramento), "
-        "sempre BAIXA prioridade e score <= 20, mesmo repetido.\n"
-        "2) ALTA prioridade quando houver dinheiro/pagamento/cobrança/vencimento/renovação, "
-        "assunto de escola, ou prazo explícito.\n"
-        "3) MÉDIA quando for relevante mas sem ação clara imediata.\n"
-        "4) BAIXA para promoções/newsletters/social ou coisas que podem ser ignoradas.\n\n"
-        "Para cada item gere:\n"
-        "- score (0–100)\n"
-        "- bucket: ALTA | MÉDIA | BAIXA\n"
-        "- one_liner: 1–2 frases humanas dizendo (a) o tema e (b) por que importa ou por que pode ignorar.\n"
-        "- actions: 1–3 ações práticas curtas, apenas se fizer sentido.\n\n"
-        "Responda APENAS em JSON no formato:\n"
-        "{ \"items\": [ {\"subject\":\"...\",\"score\":90,\"bucket\":\"ALTA\",\"one_liner\":\"...\",\"actions\":[\"...\"]} ] }\n"
-    )
-
-    payload_emails = []
-    for e in emails:
-        payload_emails.append({
-            "subject": e.get("subject", ""),
-            "from": e.get("from", ""),
-            "date": e.get("date", ""),
-            "snippet": e.get("snippet", ""),
-            "tech_alert": bool(e.get("_tech_alert")),
-        })
-
-    user_prompt = "Classifique estes emails:\n" + json.dumps(payload_emails, ensure_ascii=False)
-
-    try:
-        resp = client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-        )
-        text = resp.choices[0].message.content or ""
-    except Exception:
-        return None
-
-    try:
-        data = json.loads(_extract_json(text))
-        items = data.get("items", [])
-        if not isinstance(items, list):
-            return None
-
-        cleaned = []
-        for it in items:
-            subj = str(it.get("subject", "")).strip() or "(sem assunto)"
-            score = int(it.get("score", 0))
-            score = max(0, min(100, score))
-
-            bucket = str(it.get("bucket", "")).strip().upper()
-            bucket = _bucket_from_score(score)  # força coerência
-
-            one = str(it.get("one_liner", "")).strip()
-            if not one:
-                # se vier vazio, cria um tema humano no fallback
-                one = _infer_topic_line({"subject": subj, "from": "", "snippet": ""})
-
-            actions = it.get("actions", [])
-            if not isinstance(actions, list):
-                actions = []
-            actions = [str(a).strip() for a in actions if str(a).strip()][:3]
-
-            # segurança: se for tech_alert, rebaixa
-            if _looks_like_tech_alert({"subject": subj, "from": "", "snippet": one}):
-                score = min(score, 20)
-                bucket = "BAIXA"
-
-            cleaned.append({
-                "subject": subj,
-                "score": score,
-                "bucket": bucket,
-                "one_liner": one,
-                "actions": actions,
-            })
-
-        # ordena
-        cleaned.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
-        return cleaned
-
-    except Exception:
-        return None
-
-
-def _extract_json(text: str) -> str:
-    text = (text or "").strip()
-    if text.startswith("{") and text.endswith("}"):
-        return text
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return text[start:end + 1]
-    return text
-
-
-# ==========
-# Fallback (sem LLM)
-# ==========
-
-def _fallback_item(e: Dict[str, Any]) -> Dict[str, Any]:
-    subject = e.get("subject", "(sem assunto)")
-    text = f"{e.get('subject','')} {e.get('from','')} {e.get('snippet','')}".lower()
-
-    if e.get("_tech_alert"):
-        score = 10
-        bucket = "BAIXA"
-        one = "Isso é um alerta técnico automático (infra/serviço). Pode ignorar."
-        actions = []
-        return {"subject": subject, "score": score, "bucket": bucket, "one_liner": one, "actions": actions}
-
-    hits = sum(1 for kw in HIGH_INTENT_KEYWORDS if kw in text)
-
-    if hits >= 2:
-        score = 85
-        bucket = "ALTA"
-        one = "Isso parece envolver dinheiro/prazo (cobrança, vencimento, renovação ou algo a resolver). Eu abriria."
-        actions = [
-            "Abrir o email e identificar valor/prazo.",
-            "Resolver agora (pagar/renovar/responder) se fizer sentido.",
-        ]
-    elif hits == 1:
-        score = 55
-        bucket = "MÉDIA"
-        one = "Pode ser algo relevante (conta, compra, escola ou prazo), mas não está explícito. Vale uma olhada rápida."
-        actions = ["Abrir e decidir se vira pendência."]
-    else:
-        score = 25
-        bucket = "BAIXA"
-        one = _infer_topic_line(e)
-        actions = []
-
-    return {"subject": subject, "score": score, "bucket": bucket, "one_liner": one, "actions": actions}
-
-
-def _infer_topic_line(e: Dict[str, Any]) -> str:
-    subject = (e.get("subject") or "").strip()
-    sender = (e.get("from") or "").strip()
-    text = f"{subject} {e.get('snippet','')}".lower()
-
-    if any(k in text for k in ["pedido", "compra", "confirmad", "nota fiscal", "entrega", "rastre"]):
-        return "Parece ser sobre compra/entrega (confirmação ou atualização). Dá pra ignorar se você já estiver ciente."
-    if any(k in text for k in ["newsletter", "manchetes", "braziljournal", "news", "alerta do google", "google alerts"]):
-        return "Isso é conteúdo informativo/newsletter (pra ler quando tiver tempo)."
-    if any(k in text for k in ["desconto", "promo", "oferta", "off", "últimas horas", "final call"]):
-        return "É promoção/marketing. Pode arquivar sem culpa se não estiver procurando isso."
-    if any(k in text for k in ["notion", "projeto", "re:", "meeting", "call"]):
-        return "Parece algo de trabalho/projeto. Se não for urgente, dá pra deixar para revisar depois."
-    if sender:
-        return f"Email geral de {sender}: se não te puxar a atenção, pode arquivar."
-    return "Email geral: não parece exigir ação agora. Pode arquivar."
-
-
-def _bucket_from_score(score: int) -> str:
+def _bucket(score: int) -> str:
     if score >= 75:
         return "ALTA"
     if score >= 45:
@@ -300,50 +95,96 @@ def _bucket_from_score(score: int) -> str:
     return "BAIXA"
 
 
-# ==========
-# Formatação
-# ==========
+def _human_summary(subject: str, sender: str, snippet: str) -> str:
+    """
+    Resumo “com cara de assistente”:
+    - 1 linha que diga o que é e por que importa
+    """
+    s = subject
+    sn = snippet
 
-def _format_summary(items: List[Dict[str, Any]]) -> str:
-    high = [i for i in items if i.get("bucket") == "ALTA"]
-    med = [i for i in items if i.get("bucket") == "MÉDIA"]
-    low = [i for i in items if i.get("bucket") == "BAIXA"]
+    # tenta extrair “o que parece ser”
+    if re.search(r"\brenova", (s + " " + sn).lower()):
+        return "Parece uma renovação/assinatura chegando no prazo — vale abrir pra ver condições e evitar interrupção."
+    if re.search(r"\bfatura|\bbolet|\bcobran|\bpagamento|\bvenc", (s + " " + sn).lower()):
+        return "Isso tem cara de cobrança/fatura com prazo — eu abriria pra checar valor e data de vencimento."
+    if re.search(r"\bescola|\bmatr|\brematr|\bmensalidade|\bprova|\bmaterial", (s + " " + sn).lower()):
+        return "Assunto de escola: provavelmente mensalidade, rematrícula ou aviso importante — melhor conferir."
+    if re.search(r"\brecibo|\bnota fiscal|\bimposto|\birpf", (s + " " + sn).lower()):
+        return "Parece documento/recibo/impostos — pode ser útil guardar ou já resolver pendência."
+    if _looks_like_tech_alert(s + " " + sn):
+        return "Alerta técnico de sistema/serviço. Se não for algo que você queira acompanhar, dá pra tratar como baixa prioridade."
 
-    lines: List[str] = []
+    # fallback: usa assunto + pedaço do snippet de forma natural
+    snippet_clean = re.sub(r"\s+", " ", sn).strip()
+    if len(snippet_clean) > 140:
+        snippet_clean = snippet_clean[:140].rstrip() + "…"
 
-    if high:
-        lines.append("Emails com prioridade ALTA\n")
-        lines.extend(_format_bucket(high, include_actions=True))
+    if snippet_clean:
+        return f"Resumo rápido: {snippet_clean}"
+    return "Não veio muito conteúdo no preview, mas o assunto parece simples — vale abrir se tiver curiosidade."
 
-    if med:
-        lines.append("\nEmails com prioridade MÉDIA\n")
-        lines.extend(_format_bucket(med, include_actions=True))
 
-    if low:
-        lines.append("\nEmails de BAIXA prioridade (ação opcional)\n")
-        lines.extend(_format_bucket(low, include_actions=False))
+def build_items(emails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Entrada: lista de emails (dict) — esperamos pelo menos subject/from/snippet.
+    Saída: lista de itens com score/bucket/resumo.
+    """
+    items = []
+    for e in emails:
+        subject = _safe(e.get("subject"))
+        sender = _safe(e.get("from")) or _safe(e.get("sender"))
+        snippet = _safe(e.get("snippet")) or _safe(e.get("body_preview")) or ""
+
+        # se o Gmail não trouxe snippet, não quebra
+        score = _intent_score(subject, sender, snippet)
+        bucket = _bucket(score)
+        one_liner = _human_summary(subject, sender, snippet)
+
+        items.append(
+            {
+                "subject": subject or "(sem assunto)",
+                "from": sender or "(remetente não identificado)",
+                "snippet": snippet,
+                "score": score,
+                "bucket": bucket,
+                "one_liner": one_liner,
+            }
+        )
+
+    # Ordena: prioridade + score + assunto
+    items.sort(key=lambda x: ({"ALTA": 0, "MÉDIA": 1, "BAIXA": 2}[x["bucket"]], -x["score"], x["subject"]))
+    return items
+
+
+def build_summary_from_items(items: List[Dict[str, Any]]) -> str:
+    """
+    Formata a mensagem final para Telegram.
+    """
+    groups = {"ALTA": [], "MÉDIA": [], "BAIXA": []}
+    for it in items:
+        groups[it["bucket"]].append(it)
+
+    lines = []
+    lines.append("📬 **Resumo do seu inbox (com foco no que dá dor de cabeça se atrasar)**\n")
+
+    def add_group(title: str, arr: List[Dict[str, Any]]):
+        if not arr:
+            return
+        lines.append(f"**Emails com prioridade {title}**\n")
+        for idx, it in enumerate(arr, 1):
+            lines.append(f"{idx}) [{it['score']}/100] {it['subject']}")
+            lines.append(f"- De: {it['from']}")
+            lines.append(f"- Em 1 linha: {it['one_liner']}\n")
+
+    add_group("ALTA", groups["ALTA"])
+    add_group("MÉDIA", groups["MÉDIA"])
+
+    # Para BAIXA: mantém, mas com texto útil (não “sem sinais fortes…”)
+    if groups["BAIXA"]:
+        lines.append("**Emails de BAIXA prioridade (se sobrar tempo)**\n")
+        for idx, it in enumerate(groups["BAIXA"], 1):
+            lines.append(f"{idx}) [{it['score']}/100] {it['subject']}")
+            lines.append(f"- Em 1 linha: {it['one_liner']}\n")
 
     return "\n".join(lines).strip()
-
-
-def _format_bucket(bucket_items: List[Dict[str, Any]], include_actions: bool) -> List[str]:
-    out: List[str] = []
-    for idx, it in enumerate(bucket_items, start=1):
-        score = int(it.get("score", 0))
-        subj = it.get("subject", "(sem assunto)")
-        one = it.get("one_liner", "").strip()
-
-        out.append(f"{idx}) [{score}/100] {subj}")
-        out.append(f"- {one}")
-
-        if include_actions:
-            actions = it.get("actions", [])
-            if isinstance(actions, list) and actions:
-                out.append("  Ações:")
-                for a in actions[:3]:
-                    out.append(f"  - {a}")
-
-        out.append("")  # linha em branco
-    if out and out[-1] == "":
-        out.pop()
-    return out
