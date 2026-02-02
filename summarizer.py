@@ -1,175 +1,130 @@
-# summarizer.py
-# Objetivo: priorizar emails realmente úteis (banco/contas/escola/vencimentos) e
-# rebaixar/ignorar alertas de sistemas (Render/Railway/etc).
-#
-# Espera receber `emails` como lista de dicts (ex.: vindos do gmail_client.py),
-# contendo ao menos: subject, from (ou sender), snippet (opcional), date (opcional)
-#
-# Saída: string pronta para enviar ao Telegram.
-
 from __future__ import annotations
 
+import json
 import os
 import re
-import json
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Tuple, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 
-# -----------------------------
-# Config
-# -----------------------------
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MAX_EMAILS_TO_SEND = int(os.getenv("MAX_EMAILS_TO_SEND", "40"))
 
-# Palavras/expressões que tipicamente NÃO interessam (infra/alertas, newsletters, promo)
-IGNORE_SUBJECT_PATTERNS = [
-    r"\bRender\b",
-    r"\bRailway\b",
-    r"\bDeployment crashed\b",
-    r"\bServer failure\b",
-    r"\bincident\b",
-    r"\balert\b",
-    r"\bstatus\b",
-    r"\bmonitor\b",
-    r"\bunhealthy\b",
-    r"\bdown\b",
-    r"\bcrash\b",
-    r"\berror\b",
-    r"\bfailure\b",
-    r"\bSEV\b",
-    r"\bPagerDuty\b",
-    r"\bDatadog\b",
-    r"\bSentry\b",
-    r"\bUptime\b",
-    r"\bNew Relic\b",
-    r"\bAWS\b",
-    r"\bGCP\b",
-    r"\bAzure\b",
+
+# ==========
+# Heurísticas locais (antes do LLM)
+# ==========
+
+TECH_ALERT_KEYWORDS = [
+    "render", "railway", "deployment", "crashed", "server failure", "incident", "downtime",
+    "uptime", "statuspage", "monitoring", "error rate", "latency",
+    "kubernetes", "pod", "container", "healthcheck", "cpu", "memory",
+]
+TECH_SENDER_PATTERNS = [
+    r"@render\.com",
+    r"@railway\.app",
+    r"@statuspage\.io",
+    r"@pagerduty\.com",
+    r"@datadoghq\.com",
+    r"@uptimerobot\.com",
+    r"@sentry\.io",
 ]
 
-LOW_PRIORITY_PATTERNS = [
-    r"\bnewsletter\b",
-    r"\bpromo\b",
-    r"\bdesconto\b",
-    r"\boferta\b",
-    r"\bmarketing\b",
-    r"\búltimas horas\b",
-    r"\bfinal call\b",
-    r"\bTikTok\b",
-    r"\bStrava\b",
-    r"\bVans\b",
-    r"\bEsporte\b",
-]
-
-# O que você quer como "mais importante"
-HIGH_PRIORITY_KEYWORDS = [
-    # Banco / financeiro
+HIGH_INTENT_KEYWORDS = [
+    # banco / pagamentos / cobranças / prazos
     "banco", "itau", "itaú", "bradesco", "santander", "nubank", "caixa", "bb", "banco do brasil",
-    "fatura", "cartão", "cartao", "boleto", "pix", "transferência", "transferencia", "pagamento",
-    "cobrança", "cobranca", "inadimplência", "inadimplencia", "juros", "multa",
-    "limite", "fraude", "suspeita", "compra não reconhecida", "compra nao reconhecida",
-    "comprovante", "extrato", "débito", "debito", "crédito", "credito",
-    "renegociação", "renegociacao",
-    # Contas a vencer
-    "vencimento", "vence", "a vencer", "atraso", "em atraso", "segunda via", "2ª via", "2a via",
-    "corte", "suspensão", "suspensao", "negativação", "negativacao",
+    "boleto", "fatura", "cobrança", "cobranca", "pagamento", "venc", "vence", "vencimento",
+    "atraso", "pendente", "débito", "debito", "inadimpl", "juros", "multa", "pix",
+    "cartão", "cartao", "estorno", "reembolso", "chargeback", "comprovante", "extrato",
+    "renovação", "renovacao", "assinatura", "plano",
     "iptu", "ipva", "condomínio", "condominio", "aluguel", "energia", "luz", "água", "agua",
     "internet", "telefone", "plano de saúde", "plano de saude",
-    # Escola / filhos
+    # escola
     "escola", "colégio", "colegio", "mensalidade", "rematrícula", "rematricula",
-    "boletim", "prova", "reunião", "reuniao", "coordenação", "coordenacao",
-    "matrícula", "matricula", "material escolar", "sala", "turma",
-    "agenda", "aviso", "comunicado",
+    "matrícula", "matricula", "boletim", "prova", "reunião", "reuniao", "material",
+    # compras (pode envolver cobrança/prazo)
+    "pedido confirmado", "pedido", "compra", "nota fiscal", "entrega", "rastreio", "rastreamento",
+    # “associação/cadastro falhou” pode ser dinheiro/serviço
+    "associação", "associacao", "não foi realizada", "nao foi realizada", "recusado", "recusada",
 ]
 
-MEDIUM_PRIORITY_KEYWORDS = [
-    "google alerts", "alerta do google", "jtekt", "notícia", "noticia",
-    "confirmação", "confirmacao", "reserva", "viagem", "documento",
-]
-
-# Data/“vencimento” costuma aparecer assim:
-DATE_REGEXES = [
-    r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b",     # 05/02 ou 05/02/2026
-    r"\b(\d{1,2})-(\d{1,2})(?:-(\d{2,4}))?\b",     # 05-02 ou 05-02-2026
-    r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\b",   # 05.02 ou 05.02.2026
-]
-
-DUE_HINTS = [
-    "venc", "vence", "a vencer", "vencimento", "prazo", "deadline",
-    "último dia", "ultimo dia", "final", "hoje", "amanhã", "amanha",
+LOW_LIKELY_TOPICS = [
+    # promo/newsletter/social
+    "newsletter", "promo", "desconto", "oferta", "últimas horas", "ultima chance", "final call",
+    "tiktok", "strava", "vans",
 ]
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+def build_summary(emails: List[Dict[str, Any]]) -> str:
+    normalized = [_normalize_email(e) for e in (emails or [])][:MAX_EMAILS_TO_SEND]
+    if not normalized:
+        return "Nenhum email encontrado."
 
-def _get(email: Dict[str, Any], *keys: str, default: str = "") -> str:
-    for k in keys:
-        v = email.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return default
+    for e in normalized:
+        e["_tech_alert"] = _looks_like_tech_alert(e)
 
-def _norm(s: str) -> str:
-    return (s or "").strip().lower()
+    # Tenta LLM (com tom humano)
+    items = _classify_with_llm(normalized)
+    if items:
+        return _format_summary(items)
 
-def _matches_any(text: str, patterns: List[str]) -> bool:
-    t = text or ""
-    for p in patterns:
-        if re.search(p, t, flags=re.IGNORECASE):
+    # Fallback (sem LLM)
+    items_fb = [_fallback_item(e) for e in normalized]
+    return _format_summary(items_fb)
+
+
+def _normalize_email(e: Dict[str, Any]) -> Dict[str, Any]:
+    subject = (e.get("subject") or "").strip() or "(sem assunto)"
+    sender = (e.get("from") or e.get("sender") or "").strip() or "(remetente desconhecido)"
+    snippet = (e.get("snippet") or e.get("body") or "").strip()
+
+    dt = e.get("date") or e.get("internalDate") or e.get("internal_date")
+    iso_date = _to_iso(dt)
+
+    return {
+        "id": e.get("id") or "",
+        "subject": subject,
+        "from": sender,
+        "snippet": snippet[:800],
+        "date": iso_date,
+    }
+
+
+def _to_iso(dt: Any) -> str:
+    try:
+        if dt is None:
+            return ""
+        if isinstance(dt, (int, float)):
+            if dt > 10_000_000_000:  # ms
+                dt = dt / 1000.0
+            return datetime.fromtimestamp(dt).isoformat()
+        if isinstance(dt, str):
+            return dt
+    except Exception:
+        pass
+    return ""
+
+
+def _looks_like_tech_alert(e: Dict[str, Any]) -> bool:
+    sender = (e.get("from") or "").lower()
+    text = f"{e.get('subject','')} {e.get('from','')} {e.get('snippet','')}".lower()
+
+    for pat in TECH_SENDER_PATTERNS:
+        if re.search(pat, sender):
             return True
-    return False
 
-def _contains_any(text: str, keywords: List[str]) -> bool:
-    t = _norm(text)
-    for kw in keywords:
-        if kw in t:
-            return True
-    return False
-
-def _extract_first_date(text: str) -> Optional[datetime]:
-    if not text:
-        return None
-
-    now = datetime.now()
-    for rx in DATE_REGEXES:
-        m = re.search(rx, text)
-        if not m:
-            continue
-        day = int(m.group(1))
-        month = int(m.group(2))
-        year_str = m.group(3)
-        if year_str:
-            y = int(year_str)
-            if y < 100:
-                y += 2000
-            year = y
-        else:
-            year = now.year
-
-        try:
-            return datetime(year, month, day)
-        except ValueError:
-            continue
-    return None
-
-def _days_until(dt: datetime) -> int:
-    today = datetime.now().date()
-    return (dt.date() - today).days
+    return any(kw in text for kw in TECH_ALERT_KEYWORDS)
 
 
-# -----------------------------
-# "Inteligência do ChatGPT"
-# (chamada opcional: só para emails não-óbvios)
-# -----------------------------
+# ==========
+# LLM
+# ==========
 
-def _openai_chat(prompt: str) -> Optional[str]:
+def _classify_with_llm(emails: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
 
-    # Evita quebrar caso openai não esteja instalado / não queira usar agora
     try:
         from openai import OpenAI  # type: ignore
     except Exception:
@@ -177,287 +132,217 @@ def _openai_chat(prompt: str) -> Optional[str]:
 
     client = OpenAI(api_key=api_key)
 
-    # Modelo: use um pequeno e barato. Se você trocar depois, só altere aqui.
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    system_prompt = (
+        "Você é um assistente humano do Leandro, responsável por triagem de emails.\n"
+        "TOM: escreva de forma natural, direta e útil — como um assistente pessoal.\n"
+        "Sem linguagem robótica. Nada de 'sem sinais fortes'.\n\n"
+        "OBJETIVO: priorizar banco/contas/escola/prazos. Alertas técnicos não importam.\n\n"
+        "REGRAS FORTES:\n"
+        "1) Se o email for alerta técnico (Render/Railway/deployment/incident/status/monitoramento), "
+        "sempre BAIXA prioridade e score <= 20, mesmo repetido.\n"
+        "2) ALTA prioridade quando houver dinheiro/pagamento/cobrança/vencimento/renovação, "
+        "assunto de escola, ou prazo explícito.\n"
+        "3) MÉDIA quando for relevante mas sem ação clara imediata.\n"
+        "4) BAIXA para promoções/newsletters/social ou coisas que podem ser ignoradas.\n\n"
+        "Para cada item gere:\n"
+        "- score (0–100)\n"
+        "- bucket: ALTA | MÉDIA | BAIXA\n"
+        "- one_liner: 1–2 frases humanas dizendo (a) o tema e (b) por que importa ou por que pode ignorar.\n"
+        "- actions: 1–3 ações práticas curtas, apenas se fizer sentido.\n\n"
+        "Responda APENAS em JSON no formato:\n"
+        "{ \"items\": [ {\"subject\":\"...\",\"score\":90,\"bucket\":\"ALTA\",\"one_liner\":\"...\",\"actions\":[\"...\"]} ] }\n"
+    )
+
+    payload_emails = []
+    for e in emails:
+        payload_emails.append({
+            "subject": e.get("subject", ""),
+            "from": e.get("from", ""),
+            "date": e.get("date", ""),
+            "snippet": e.get("snippet", ""),
+            "tech_alert": bool(e.get("_tech_alert")),
+        })
+
+    user_prompt = "Classifique estes emails:\n" + json.dumps(payload_emails, ensure_ascii=False)
 
     try:
         resp = client.chat.completions.create(
-            model=model,
+            model=DEFAULT_MODEL,
             messages=[
-                {"role": "system", "content": "Você classifica emails por importância pessoal. Responda APENAS em JSON."},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,
         )
-        return resp.choices[0].message.content
+        text = resp.choices[0].message.content or ""
     except Exception:
-        return None
-
-
-@dataclass
-class ClassifiedEmail:
-    subject: str
-    sender: str
-    snippet: str
-    priority: str  # "ALTA", "MEDIA", "BAIXA", "IGNORAR"
-    score: int     # 0-100
-    one_liner: str
-    actions: List[str]
-    due_date: Optional[datetime] = None
-
-
-# -----------------------------
-# Classificação (regra + LLM opcional)
-# -----------------------------
-
-def classify_email(email: Dict[str, Any]) -> ClassifiedEmail:
-    subject = _get(email, "subject", default="(sem assunto)")
-    sender = _get(email, "from", "sender", "from_email", default="(remetente desconhecido)")
-    snippet = _get(email, "snippet", "body", default="")
-
-    blob = f"{subject}\n{sender}\n{snippet}"
-
-    # 1) Ignorar infra/alertas
-    if _matches_any(blob, IGNORE_SUBJECT_PATTERNS):
-        return ClassifiedEmail(
-            subject=subject,
-            sender=sender,
-            snippet=snippet,
-            priority="IGNORAR",
-            score=0,
-            one_liner="Alerta/monitoramento de sistema (ignorado por regra).",
-            actions=["Ignorar/arquivar (não é prioridade pessoal)."],
-        )
-
-    # 2) Baixa prioridade (newsletters, promo, social)
-    if _matches_any(blob, LOW_PRIORITY_PATTERNS):
-        return ClassifiedEmail(
-            subject=subject,
-            sender=sender,
-            snippet=snippet,
-            priority="BAIXA",
-            score=15,
-            one_liner="Conteúdo promocional/newsletter/social.",
-            actions=["Arquivar ou mover para pasta/label de promo/newsletter."],
-        )
-
-    # 3) Alta prioridade por palavras-chave (banco/contas/escola/vencimentos)
-    due_date = _extract_first_date(blob)
-    has_due_hint = any(h in _norm(blob) for h in DUE_HINTS)
-    has_high_kw = _contains_any(blob, HIGH_PRIORITY_KEYWORDS)
-
-    if has_high_kw or (has_due_hint and due_date is not None):
-        score = 85
-        actions: List[str] = []
-
-        # Ajuste por proximidade do vencimento
-        if due_date is not None:
-            d = _days_until(due_date)
-            if d <= 0:
-                score = 100
-                actions.append("Verificar se está vencido hoje/atrasado e regularizar imediatamente.")
-            elif d <= 2:
-                score = 95
-                actions.append("Agendar pagamento/ação hoje para não perder o prazo.")
-            elif d <= 7:
-                score = 90
-                actions.append("Colocar lembrete e planejar pagamento/ação ainda nesta semana.")
-            else:
-                score = 85
-                actions.append("Registrar na sua lista de pendências com lembrete.")
-
-        # Ações específicas (heurísticas)
-        t = _norm(blob)
-        if any(k in t for k in ["fatura", "boleto", "vencimento", "a vencer", "segunda via", "2a via", "2ª via"]):
-            actions.insert(0, "Abrir o email e verificar valor, vencimento e forma de pagamento.")
-            actions.append("Se possível, pagar via app/banco e arquivar o comprovante.")
-        if any(k in t for k in ["fraude", "suspeita", "compra não reconhecida", "compra nao reconhecida"]):
-            actions.insert(0, "Abrir imediatamente: possível fraude. Bloquear/contestar no app do banco.")
-        if any(k in t for k in ["escola", "colégio", "colegio", "mensalidade", "rematrícula", "rematricula", "boletim"]):
-            actions.insert(0, "Abrir e checar se há prazo/ação (mensalidade, rematrícula, comunicado).")
-
-        one_liner = "Banco/contas/escola/prazo: requer ação prática."
-        if due_date is not None:
-            one_liner = f"{one_liner} Data detectada: {due_date.strftime('%d/%m/%Y')}."
-
-        # Remover duplicatas e manter curto
-        actions = _dedupe_keep_order([a for a in actions if a.strip()])[:5]
-
-        return ClassifiedEmail(
-            subject=subject,
-            sender=sender,
-            snippet=snippet,
-            priority="ALTA",
-            score=min(100, score),
-            one_liner=one_liner,
-            actions=actions,
-            due_date=due_date,
-        )
-
-    # 4) Média prioridade por tema (sem urgência clara)
-    if _contains_any(blob, MEDIUM_PRIORITY_KEYWORDS):
-        return ClassifiedEmail(
-            subject=subject,
-            sender=sender,
-            snippet=snippet,
-            priority="MEDIA",
-            score=55,
-            one_liner="Possivelmente relevante, mas sem urgência clara.",
-            actions=["Ler rapidamente e decidir se vira pendência/encaminhamento."],
-        )
-
-    # 5) Zona cinzenta → usar LLM para decidir se é banco/conta/escola/prazo
-    llm = _classify_with_llm(subject, sender, snippet)
-    if llm is not None:
-        return llm
-
-    # 6) Fallback: baixa por padrão (triagem manual)
-    return ClassifiedEmail(
-        subject=subject,
-        sender=sender,
-        snippet=snippet,
-        priority="BAIXA",
-        score=25,
-        one_liner="Sem sinais fortes de ser banco/conta/escola/prazo.",
-        actions=["Arquivar ou revisar depois se tiver tempo."],
-    )
-
-
-def _classify_with_llm(subject: str, sender: str, snippet: str) -> Optional[ClassifiedEmail]:
-    # Evita enviar textos longos demais
-    snippet_short = (snippet or "")[:800]
-
-    prompt = {
-        "tarefa": "Classifique o email para prioridade pessoal do usuário.",
-        "regras": {
-            "ALTA": "banco, fatura, boleto, contas, cobrança, aviso de vencimento, escola, rematrícula, prazo com ação necessária",
-            "MEDIA": "relevante mas sem prazo/ação imediata clara",
-            "BAIXA": "promoções, newsletters, social, assuntos não essenciais",
-            "IGNORAR": "alertas de infraestrutura/monitoramento (Render/Railway/incident/status/error/failure/etc)",
-        },
-        "email": {"subject": subject, "from": sender, "snippet": snippet_short},
-        "responda_em_json": {
-            "priority": "ALTA|MEDIA|BAIXA|IGNORAR",
-            "one_liner": "string curta",
-            "actions": ["lista curta de ações práticas, máx 4"],
-        },
-    }
-
-    raw = _openai_chat(json.dumps(prompt, ensure_ascii=False))
-    if not raw:
         return None
 
     try:
-        data = json.loads(raw)
-        pr = str(data.get("priority", "")).upper().strip()
-        one = str(data.get("one_liner", "")).strip() or "Classificado pelo modelo."
-        acts = data.get("actions", [])
-        if not isinstance(acts, list):
-            acts = []
-        acts = [str(a).strip() for a in acts if str(a).strip()]
-        acts = _dedupe_keep_order(acts)[:4]
-
-        if pr not in {"ALTA", "MEDIA", "BAIXA", "IGNORAR"}:
+        data = json.loads(_extract_json(text))
+        items = data.get("items", [])
+        if not isinstance(items, list):
             return None
 
-        score_map = {"IGNORAR": 0, "BAIXA": 25, "MEDIA": 55, "ALTA": 85}
-        return ClassifiedEmail(
-            subject=subject,
-            sender=sender,
-            snippet=snippet,
-            priority=pr,
-            score=score_map[pr],
-            one_liner=one,
-            actions=acts if acts else ["Ler e decidir ação."],
-        )
+        cleaned = []
+        for it in items:
+            subj = str(it.get("subject", "")).strip() or "(sem assunto)"
+            score = int(it.get("score", 0))
+            score = max(0, min(100, score))
+
+            bucket = str(it.get("bucket", "")).strip().upper()
+            bucket = _bucket_from_score(score)  # força coerência
+
+            one = str(it.get("one_liner", "")).strip()
+            if not one:
+                # se vier vazio, cria um tema humano no fallback
+                one = _infer_topic_line({"subject": subj, "from": "", "snippet": ""})
+
+            actions = it.get("actions", [])
+            if not isinstance(actions, list):
+                actions = []
+            actions = [str(a).strip() for a in actions if str(a).strip()][:3]
+
+            # segurança: se for tech_alert, rebaixa
+            if _looks_like_tech_alert({"subject": subj, "from": "", "snippet": one}):
+                score = min(score, 20)
+                bucket = "BAIXA"
+
+            cleaned.append({
+                "subject": subj,
+                "score": score,
+                "bucket": bucket,
+                "one_liner": one,
+                "actions": actions,
+            })
+
+        # ordena
+        cleaned.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
+        return cleaned
+
     except Exception:
         return None
 
 
-def _dedupe_keep_order(items: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for it in items:
-        if it not in seen:
-            out.append(it)
-            seen.add(it)
-    return out
+def _extract_json(text: str) -> str:
+    text = (text or "").strip()
+    if text.startswith("{") and text.endswith("}"):
+        return text
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+    return text
 
 
-# -----------------------------
-# Agrupamento e resumo final
-# -----------------------------
+# ==========
+# Fallback (sem LLM)
+# ==========
 
-def group_by_subject(emails: List[ClassifiedEmail]) -> Dict[str, Tuple[ClassifiedEmail, int]]:
-    """
-    Junta emails idênticos (mesmo subject normalizado).
-    Retorna dict: key -> (email_representante, contagem)
-    """
-    grouped: Dict[str, Tuple[ClassifiedEmail, int]] = {}
-    for e in emails:
-        key = re.sub(r"\s+", " ", _norm(e.subject))
-        if key in grouped:
-            rep, n = grouped[key]
-            # Mantém o "melhor" (maior score) como representante
-            if e.score > rep.score:
-                grouped[key] = (e, n + 1)
-            else:
-                grouped[key] = (rep, n + 1)
-        else:
-            grouped[key] = (e, 1)
-    return grouped
+def _fallback_item(e: Dict[str, Any]) -> Dict[str, Any]:
+    subject = e.get("subject", "(sem assunto)")
+    text = f"{e.get('subject','')} {e.get('from','')} {e.get('snippet','')}".lower()
+
+    if e.get("_tech_alert"):
+        score = 10
+        bucket = "BAIXA"
+        one = "Isso é um alerta técnico automático (infra/serviço). Pode ignorar."
+        actions = []
+        return {"subject": subject, "score": score, "bucket": bucket, "one_liner": one, "actions": actions}
+
+    hits = sum(1 for kw in HIGH_INTENT_KEYWORDS if kw in text)
+
+    if hits >= 2:
+        score = 85
+        bucket = "ALTA"
+        one = "Isso parece envolver dinheiro/prazo (cobrança, vencimento, renovação ou algo a resolver). Eu abriria."
+        actions = [
+            "Abrir o email e identificar valor/prazo.",
+            "Resolver agora (pagar/renovar/responder) se fizer sentido.",
+        ]
+    elif hits == 1:
+        score = 55
+        bucket = "MÉDIA"
+        one = "Pode ser algo relevante (conta, compra, escola ou prazo), mas não está explícito. Vale uma olhada rápida."
+        actions = ["Abrir e decidir se vira pendência."]
+    else:
+        score = 25
+        bucket = "BAIXA"
+        one = _infer_topic_line(e)
+        actions = []
+
+    return {"subject": subject, "score": score, "bucket": bucket, "one_liner": one, "actions": actions}
 
 
-def build_summary(emails: List[Dict[str, Any]]) -> str:
-    classified = [classify_email(e) for e in emails]
+def _infer_topic_line(e: Dict[str, Any]) -> str:
+    subject = (e.get("subject") or "").strip()
+    sender = (e.get("from") or "").strip()
+    text = f"{subject} {e.get('snippet','')}".lower()
 
-    # Tirar "IGNORAR" do relatório (se quiser ver, troque aqui para manter em BAIXA)
-    kept = [c for c in classified if c.priority != "IGNORAR"]
+    if any(k in text for k in ["pedido", "compra", "confirmad", "nota fiscal", "entrega", "rastre"]):
+        return "Parece ser sobre compra/entrega (confirmação ou atualização). Dá pra ignorar se você já estiver ciente."
+    if any(k in text for k in ["newsletter", "manchetes", "braziljournal", "news", "alerta do google", "google alerts"]):
+        return "Isso é conteúdo informativo/newsletter (pra ler quando tiver tempo)."
+    if any(k in text for k in ["desconto", "promo", "oferta", "off", "últimas horas", "final call"]):
+        return "É promoção/marketing. Pode arquivar sem culpa se não estiver procurando isso."
+    if any(k in text for k in ["notion", "projeto", "re:", "meeting", "call"]):
+        return "Parece algo de trabalho/projeto. Se não for urgente, dá pra deixar para revisar depois."
+    if sender:
+        return f"Email geral de {sender}: se não te puxar a atenção, pode arquivar."
+    return "Email geral: não parece exigir ação agora. Pode arquivar."
 
-    grouped = group_by_subject(kept)
-    items = []
-    for _, (rep, count) in grouped.items():
-        items.append((rep, count))
 
-    # Ordenar por score desc, depois por prioridade
-    items.sort(key=lambda x: (x[0].score, x[1]), reverse=True)
+def _bucket_from_score(score: int) -> str:
+    if score >= 75:
+        return "ALTA"
+    if score >= 45:
+        return "MÉDIA"
+    return "BAIXA"
 
-    high = [(e, c) for e, c in items if e.priority == "ALTA"]
-    med = [(e, c) for e, c in items if e.priority == "MEDIA"]
-    low = [(e, c) for e, c in items if e.priority == "BAIXA"]
+
+# ==========
+# Formatação
+# ==========
+
+def _format_summary(items: List[Dict[str, Any]]) -> str:
+    high = [i for i in items if i.get("bucket") == "ALTA"]
+    med = [i for i in items if i.get("bucket") == "MÉDIA"]
+    low = [i for i in items if i.get("bucket") == "BAIXA"]
 
     lines: List[str] = []
+
     if high:
         lines.append("Emails com prioridade ALTA\n")
-        lines.extend(_format_block(high))
-    if med:
-        if lines:
-            lines.append("")
-        lines.append("Emails com prioridade MÉDIA\n")
-        lines.extend(_format_block(med))
-    if low:
-        if lines:
-            lines.append("")
-        lines.append("Emails de BAIXA prioridade (ação opcional)\n")
-        lines.extend(_format_block(low, include_actions=False))
+        lines.extend(_format_bucket(high, include_actions=True))
 
-    if not lines:
-        return "Nada relevante encontrado (banco/contas/escola/prazos)."
+    if med:
+        lines.append("\nEmails com prioridade MÉDIA\n")
+        lines.extend(_format_bucket(med, include_actions=True))
+
+    if low:
+        lines.append("\nEmails de BAIXA prioridade (ação opcional)\n")
+        lines.extend(_format_bucket(low, include_actions=False))
 
     return "\n".join(lines).strip()
 
 
-def _format_block(block: List[Tuple[ClassifiedEmail, int]], include_actions: bool = True) -> List[str]:
+def _format_bucket(bucket_items: List[Dict[str, Any]], include_actions: bool) -> List[str]:
     out: List[str] = []
-    for idx, (e, count) in enumerate(block, start=1):
-        count_txt = f" (recebido {count}x)" if count > 1 else ""
-        out.append(f"{idx}) [{e.score}/100] {e.subject}{count_txt}")
-        out.append(f"- Resumo (1 linha): {e.one_liner}")
+    for idx, it in enumerate(bucket_items, start=1):
+        score = int(it.get("score", 0))
+        subj = it.get("subject", "(sem assunto)")
+        one = it.get("one_liner", "").strip()
+
+        out.append(f"{idx}) [{score}/100] {subj}")
+        out.append(f"- {one}")
+
         if include_actions:
-            if e.actions:
-                out.append("- Ações práticas:")
-                for a in e.actions:
+            actions = it.get("actions", [])
+            if isinstance(actions, list) and actions:
+                out.append("  Ações:")
+                for a in actions[:3]:
                     out.append(f"  - {a}")
+
         out.append("")  # linha em branco
     if out and out[-1] == "":
         out.pop()
