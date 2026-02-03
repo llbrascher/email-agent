@@ -1,18 +1,32 @@
 import os
+import sys
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# --- FIX: garante que o Python enxergue arquivos fora de /src (pasta pai do main.py)
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))          # /opt/render/project/src
+PROJECT_ROOT = os.path.dirname(THIS_DIR)                       # /opt/render/project
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if THIS_DIR not in sys.path:
+    sys.path.insert(0, THIS_DIR)
+# -------------------------------------------------------------
+
 from gmail_client import list_recent_emails
 from telegram_sender import send_telegram_message
-from summarizer import build_items, build_summary_from_items
 
+# Compatibilidade: tenta importar o novo, se não existir usa o antigo
+try:
+    from summarizer import build_items, build_summary_from_items
+    NEW_API = True
+except Exception:
+    from summarizer import build_summary
+    NEW_API = False
 
 TZ_NAME = os.getenv("TIMEZONE", "America/Sao_Paulo")
-RUN_TIMES = os.getenv("RUN_TIMES", "09:00,12:00,18:00")  # 3x ao dia
+RUN_TIMES = os.getenv("RUN_TIMES", "09:00,12:00,18:00")
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "30"))
-
-# Se quiser receber "tudo tranquilo" quando não houver nada relevante:
 HEARTBEAT_WHEN_EMPTY = os.getenv("HEARTBEAT_WHEN_EMPTY", "1") == "1"
 
 
@@ -39,20 +53,32 @@ def next_run(now: datetime, schedule):
 
 
 def run_once(now: datetime, slot: str):
-    print(f"[RUN] slot={slot} now={now.isoformat()} max_results={MAX_RESULTS}", flush=True)
+    print(f"[RUN] slot={slot} now={now.isoformat()} max_results={MAX_RESULTS}")
 
     emails = list_recent_emails(max_results=MAX_RESULTS) or []
-    items = build_items(emails)
 
-    if not items:
-        if HEARTBEAT_WHEN_EMPTY:
-            send_telegram_message(
-                "Tudo tranquilo por aqui.\n\n"
-                "Olhei os emails recentes e não vi nada que pareça banco/contas, escola ou prazos importantes agora."
-            )
+    if NEW_API:
+        items = build_items(emails)
+        if not items:
+            if HEARTBEAT_WHEN_EMPTY:
+                send_telegram_message(
+                    "Tudo tranquilo por aqui.\n\n"
+                    "Olhei os emails recentes e não vi nada que pareça banco/contas, escola ou prazos importantes agora."
+                )
+            return
+
+        msg = build_summary_from_items(items)
+        if msg and msg.strip():
+            send_telegram_message(msg)
         return
 
-    msg = build_summary_from_items(items)
+    # API antiga
+    msg = build_summary(emails)
+    if (not msg or not msg.strip()) and HEARTBEAT_WHEN_EMPTY:
+        msg = (
+            "Tudo tranquilo por aqui.\n\n"
+            "Olhei os emails recentes e não vi nada que pareça banco/contas, escola ou prazos importantes agora."
+        )
     if msg and msg.strip():
         send_telegram_message(msg)
 
@@ -63,29 +89,21 @@ def main_loop():
     if not schedule:
         raise RuntimeError("RUN_TIMES vazio. Ex: 09:00,12:00,18:00")
 
-    print(
-        f"BOOT: worker loop started | TZ={TZ_NAME} | RUN_TIMES={RUN_TIMES} | MAX_RESULTS={MAX_RESULTS}",
-        flush=True
-    )
+    print(f"BOOT: worker loop started | TZ={TZ_NAME} | RUN_TIMES={RUN_TIMES} | MAX_RESULTS={MAX_RESULTS}")
 
     while True:
         now = datetime.now(tz)
         nxt, slot = next_run(now, schedule)
         sleep_s = max(1, int((nxt - now).total_seconds()))
-
-        print(
-            f"[SCHEDULE] now={now.isoformat()} next={nxt.isoformat()} slot={slot} sleep={sleep_s}s",
-            flush=True
-        )
-
+        print(f"[SCHEDULE] now={now.isoformat()} next={nxt.isoformat()} slot={slot} sleep={sleep_s}s")
         time.sleep(sleep_s)
 
+        now2 = datetime.now(tz)
         try:
-            run_once(datetime.now(tz), slot)
+            run_once(now2, slot)
         except Exception as e:
-            print(f"[ERROR] run_once failed: {type(e).__name__}: {e}", flush=True)
-
-        time.sleep(2)
+            print(f"[ERROR] run_once failed: {type(e).__name__}: {e}")
+        time.sleep(3)
 
 
 if __name__ == "__main__":
