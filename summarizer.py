@@ -1,162 +1,149 @@
+import os
 import re
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
+from openai import OpenAI
+
+client = OpenAI()
 
 
-HIGH_INTENT_PATTERNS = [
-    r"\bvenc(e|imento|er)\b",
-    r"\bvence\b",
-    r"\bbolet(o|os)\b",
-    r"\bfatura\b",
-    r"\bcobran(ç|c)a\b",
-    r"\bpagamento\b",
-    r"\brenova(ç|c)ão\b",
-    r"\bmensalidade\b",
-    r"\bmatr[ií]cula\b",
-    r"\bescola\b",
-    r"\brematr[ií]cula\b",
-    r"\bprova\b",
-    r"\bmaterial\b",
-    r"\brecibo\b",
-    r"\bimposto\b",
-    r"\birpf\b",
-    r"\bseguro\b",
-    r"\bassinatura\b",
-    r"\bbanco\b",
-    r"\bcart[aã]o\b",
-    r"\bconta\b",
-    r"\bpix\b",
+# Palavras/assuntos que você quer priorizar
+HIGH_INTENT_KEYWORDS = [
+    "boleto", "fatura", "venc", "vencimento", "atras", "cobran", "pagamento",
+    "cartão", "cartao", "limite", "juros", "multa", "débito", "debito",
+    "conta", "banco", "pix", "transfer", "itau", "bradesco", "santander", "nubank",
+    "caixa", "bb", "banco do brasil", "inter", "c6", "sicredi",
+    "mensalidade", "escola", "colégio", "colegio", "matrícula", "matricula",
+    "renovação", "renovacao", "prazo", "assinatura", "renovar", "vence em",
+    "a vencer", "último aviso", "ultima chamada", "notificação", "notificacao",
 ]
 
 
-TECH_ALERT_PATTERNS = [
+# Alertas que NÃO te interessam (infra/dev)
+# Se bater nisso, a gente joga fora (ou deixa como muito baixo)
+INFRA_NOISE_PATTERNS = [
     r"\brender\b",
     r"\brailway\b",
+    r"\bdeploy\b",
     r"\bdeployment\b",
     r"\bcrash\b",
+    r"\bfailed\b",
     r"\bserver failure\b",
-    r"\binstance failed\b",
+    r"\bincident\b",
+    r"\bon[- ]call\b",
+    r"\bgithub\b",
+    r"\bactions\b",
+    r"\bstatus\b",
+    r"\bmonitor\b",
+    r"\blog\b",
     r"\berror\b",
     r"\bexception\b",
-    r"\blog\b",
-    r"\bstatuspage\b",
 ]
 
 
-def _safe(x: Any) -> str:
-    return (x or "").strip()
+def _safe_str(x: Any) -> str:
+    if x is None:
+        return ""
+    return str(x).strip()
 
 
-def _looks_like_tech_alert(text: str) -> bool:
-    t = text.lower()
-    return any(re.search(p, t) for p in TECH_ALERT_PATTERNS)
+def _is_infra_noise(subject: str, sender: str) -> bool:
+    text = f"{subject} {sender}".lower()
+    for pat in INFRA_NOISE_PATTERNS:
+        if re.search(pat, text):
+            return True
+    return False
 
 
-def _intent_score(subject: str, sender: str, snippet: str) -> int:
-    hay = f"{subject}\n{sender}\n{snippet}".lower()
-    score = 0
-
-    # derruba alertas técnicos
-    if _looks_like_tech_alert(hay):
-        score -= 35
-
-    for p in HIGH_INTENT_PATTERNS:
-        if re.search(p, hay):
-            score += 18
-
-    if any(w in hay for w in ["urgente", "importante", "ação necessária", "prazo", "último dia"]):
-        score += 12
-
-    if any(w in hay for w in ["off", "promo", "desconto", "newsletter", "oferta", "sale"]):
-        score -= 10
-
-    score = max(0, min(100, score))
-    return score
-
-
-def _bucket(score: int) -> str:
-    if score >= 75:
-        return "ALTA"
-    if score >= 45:
-        return "MÉDIA"
-    return "BAIXA"
-
-
-def _human_summary(subject: str, snippet: str) -> str:
-    hay = (subject + " " + snippet).lower()
-
-    if re.search(r"\brenova", hay):
-        return "Parece renovação/assinatura chegando perto do prazo — vale abrir pra não ter surpresa."
-    if re.search(r"\bfatura|\bbolet|\bcobran|\bpagamento|\bvenc", hay):
-        return "Cara de cobrança/fatura com prazo — eu abriria pra conferir valor e data de vencimento."
-    if re.search(r"\bescola|\bmatr|\brematr|\bmensalidade|\bprova|\bmaterial", hay):
-        return "Assunto de escola (mensalidade/rematrícula/aviso) — melhor checar."
-    if re.search(r"\brecibo|\bimposto|\birpf", hay):
-        return "Documento/recibo/impostos — pode ser algo pra guardar ou resolver."
-    if _looks_like_tech_alert(hay):
-        return "Alerta técnico de sistema/serviço (pouco relevante pra você)."
-
-    snippet_clean = re.sub(r"\s+", " ", snippet).strip()
-    if len(snippet_clean) > 160:
-        snippet_clean = snippet_clean[:160].rstrip() + "…"
-    return f"Resumo: {snippet_clean}" if snippet_clean else "Não veio preview suficiente; vale abrir se o assunto te interessar."
+def _looks_important(subject: str, snippet: str, sender: str) -> bool:
+    text = f"{subject} {snippet} {sender}".lower()
+    return any(k in text for k in HIGH_INTENT_KEYWORDS)
 
 
 def build_items(emails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    items = []
-    for e in emails:
-        subject = _safe(e.get("subject")) or "(sem assunto)"
-        sender = _safe(e.get("from")) or _safe(e.get("sender")) or "(remetente não identificado)"
-        snippet = _safe(e.get("snippet")) or _safe(e.get("body_preview")) or ""
+    """
+    Normaliza emails e remove ruído de infra.
+    Espera que cada email tenha campos tipo: subject/from/snippet/date.
+    """
+    items: List[Dict[str, Any]] = []
 
-        score = _intent_score(subject, sender, snippet)
-        bucket = _bucket(score)
-        one_liner = _human_summary(subject, snippet)
+    for e in emails or []:
+        subject = _safe_str(e.get("subject") or e.get("Subject"))
+        sender = _safe_str(e.get("from") or e.get("From") or e.get("sender"))
+        snippet = _safe_str(e.get("snippet") or e.get("Snippet") or e.get("body") or "")
 
-        items.append(
-            {
-                "subject": subject,
-                "from": sender,
-                "snippet": snippet,
-                "score": score,
-                "bucket": bucket,
-                "one_liner": one_liner,
-            }
-        )
+        # 1) Mata alertas de infra (Railway/Render etc)
+        # (a não ser que pareça cobrança/prazo etc, o que é raro)
+        if _is_infra_noise(subject, sender) and not _looks_important(subject, snippet, sender):
+            continue
 
-    items.sort(key=lambda x: ({"ALTA": 0, "MÉDIA": 1, "BAIXA": 2}[x["bucket"]], -x["score"]))
+        item = {
+            "subject": subject,
+            "from": sender,
+            "snippet": snippet[:500],  # limita pra não estourar token
+            "raw": e,
+        }
+
+        # score simples local (antes do LLM)
+        item["priority_hint"] = 90 if _looks_important(subject, snippet, sender) else 40
+
+        items.append(item)
+
     return items
 
 
 def build_summary_from_items(items: List[Dict[str, Any]]) -> str:
-    groups = {"ALTA": [], "MÉDIA": [], "BAIXA": []}
+    """
+    Usa ChatGPT para classificar e resumir de forma humana,
+    focando em banco/contas/escola/prazos, e dando ações concretas.
+    """
+    if not items:
+        return ""
+
+    # Monta um payload compacto pro modelo
+    compact = []
     for it in items:
-        groups[it["bucket"]].append(it)
+        compact.append({
+            "subject": it["subject"],
+            "from": it["from"],
+            "snippet": it["snippet"],
+            "priority_hint": it.get("priority_hint", 40),
+        })
 
-    lines = []
-    lines.append("📬 Resumo do inbox (foco: banco/contas, escola e prazos)\n")
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # pode trocar no env
+    max_items = int(os.getenv("MAX_ITEMS_IN_SUMMARY", "25"))
+    compact = compact[:max_items]
 
-    def add_group(title: str, arr: List[Dict[str, Any]]):
-        if not arr:
-            return
-        lines.append(f"Emails com prioridade {title}\n")
-        for idx, it in enumerate(arr, 1):
-            lines.append(f"{idx}) [{it['score']}/100] {it['subject']}")
-            lines.append(f"- De: {it['from']}")
-            lines.append(f"- Em 1 linha: {it['one_liner']}\n")
+    prompt = f"""
+Você é um assistente pessoal humano e direto, escrevendo em português do Brasil.
+Seu dono NÃO quer alertas de TI/infra (deploy, crash, render, railway, github etc). Esses devem ficar fora.
 
-    add_group("ALTA", groups["ALTA"])
-    add_group("MÉDIA", groups["MÉDIA"])
+Objetivo: destacar o que realmente importa para vida prática:
+- banco, contas, cobranças, faturas, boletos, vencimentos, multas, juros
+- escola/colégio/mensalidades/matrícula
+- coisas com prazo (renovação, assinatura, "vence em X dias")
+- qualquer risco financeiro ou algo que exige ação
 
-    if groups["BAIXA"]:
-        lines.append("Emails de BAIXA prioridade (se sobrar tempo)\n")
-        for idx, it in enumerate(groups["BAIXA"], 1):
-            lines.append(f"{idx}) [{it['score']}/100] {it['subject']}")
-            lines.append(f"- Em 1 linha: {it['one_liner']}\n")
+Para cada e-mail, gere:
+- score [0-100] (impacto/urgência real)
+- um resumo humano de 1–2 linhas sobre "do que se trata"
+- uma ação prática objetiva (se houver)
+- agrupar em: ALTA (>=80), MÉDIA (50-79), BAIXA (<50)
 
-    return "\n".join(lines).strip()
+Não use frases vazias tipo "sem sinais fortes...".
+Fale o tema (ex.: "promoção", "compra confirmada", "newsletter", "pesquisa profissional", "notificação social", etc).
 
+Aqui estão os emails (subject/from/snippet):
+{compact}
+""".strip()
 
-# (opcional) Compatibilidade com versão antiga, se algum código ainda chamar build_summary
-def build_summary(emails: List[Dict[str, Any]]) -> str:
-    items = build_items(emails)
-    return build_summary_from_items(items)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "Você resume emails com tom humano e foco em ações práticas."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+
+    return resp.choices[0].message.content.strip()
