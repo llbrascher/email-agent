@@ -98,10 +98,10 @@ Emails para analisar:
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "Você é um assistente pessoal experiente e confiável."},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": prompt}
         ],
         temperature=0.2,
-        max_tokens=1200,
+        max_tokens=1200
     )
 
     return response.choices[0].message.content.strip()
