@@ -114,24 +114,60 @@ def build_summary_from_items(items: List[Dict[str, Any]]) -> str:
     max_items = int(os.getenv("MAX_ITEMS_IN_SUMMARY", "25"))
     compact = compact[:max_items]
 
-    prompt = f"""
-Você é um assistente pessoal humano e direto, escrevendo em português do Brasil.
-Seu dono NÃO quer alertas de TI/infra (deploy, crash, render, railway, github etc). Esses devem ficar fora.
+ prompt = f"""
+Você é meu assistente pessoal de confiança.
 
-Objetivo: destacar o que realmente importa para vida prática:
-- banco, contas, cobranças, faturas, boletos, vencimentos, multas, juros
-- escola/colégio/mensalidades/matrícula
-- coisas com prazo (renovação, assinatura, "vence em X dias")
-- qualquer risco financeiro ou algo que exige ação
+Seu trabalho é analisar emails recentes e me ajudar a decidir:
+- no que eu preciso agir
+- no que eu só devo estar ciente
+- o que posso ignorar
 
-Para cada e-mail, gere:
-- score [0-100] (impacto/urgência real)
-- um resumo humano de 1–2 linhas sobre "do que se trata"
-- uma ação prática objetiva (se houver)
-- agrupar em: ALTA (>=80), MÉDIA (50-79), BAIXA (<50)
+REGRA MAIS IMPORTANTE: urgência vem antes de relevância.
 
-Não use frases vazias tipo "sem sinais fortes...".
-Fale o tema (ex.: "promoção", "compra confirmada", "newsletter", "pesquisa profissional", "notificação social", etc).
+Você vai classificar cada email com:
+- Score de 0 a 100
+  - 80–100 = exige ação prática minha agora ou em breve
+  - 50–79 = relevante, mas não urgente
+  - <50 = informativo, promocional ou ruído
+
+ALTA prioridade (>=80) SOMENTE quando envolver:
+- dinheiro a pagar/receber, cobrança, fatura, boleto
+- vencimento/prazo explícito (datas, “vence em X dias”, “último dia”, etc.)
+- banco/cartão, fraude, segurança de conta (login, senha, pagamento suspeito)
+- escola/filho/obrigações formais
+
+Importante:
+- Emails sobre compras já concluídas, oportunidades, benefícios, notícias, imóveis ou mercado
+  NÃO são urgentes e NÃO devem receber score alto,
+  a menos que haja prazo explícito ou risco real (ex.: pagamento pendente, cancelamento iminente, multa).
+
+Crie também a categoria:
+🕒 A VENCER
+Para itens que não são urgentes agora, mas têm prazo/datas e exigem atenção nos próximos dias
+(ex.: “vence em 7 dias”, “até dia 25”, “próxima parcela”, “renovação”).
+
+Formato de saída (obrigatório):
+
+1) ALTA (>=80)
+- no máximo 3 itens. Se houver mais, mantenha apenas os 3 mais urgentes e rebaixe o resto para MÉDIA.
+
+2) 🕒 A VENCER
+- itens com prazos futuros claros (datas/dias), mesmo que não sejam urgentes hoje.
+
+3) MÉDIA (50–79)
+
+4) BAIXA (<50)
+
+Para cada email listado, gere:
+- Score
+- Resumo humano (1–2 linhas), tom natural, como se estivesse me explicando rapidamente o que é e por que importa (ou não)
+- Ação prática objetiva, SOMENTE se realmente existir algo a fazer
+
+Evite frases genéricas tipo “sem sinais fortes”.
+Diga o TEMA do email quando não for acionável (ex.: “newsletter”, “promoção”, “confirmação de compra”, “notícia”, “aviso de conta”, etc.).
+
+Atenção: alertas de TI/infra (deploy, crash, Render, Railway, GitHub etc.) não são relevantes para mim e devem ser ignorados,
+a menos que pareçam cobrança/prazo financeiro real (muito raro).
 
 Aqui estão os emails (subject/from/snippet):
 {compact}
