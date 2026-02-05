@@ -1,179 +1,206 @@
-import os
+# summarizer.py
 import json
-from datetime import datetime
-from typing import List, Dict, Any, Tuple
+import os
+import time
+from typing import Any, Dict, List, Optional
 
-# OpenAI SDK (openai>=1.x)
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+from openai import OpenAI
 
 
-# ---------------------------
-# Helpers de normalização
-# ---------------------------
-def _get_subject(e: Dict[str, Any]) -> str:
-    return (e.get("subject") or e.get("Subject") or "").strip()
+# =========================
+# Config
+# =========================
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MAX_ITEMS = int(os.getenv("SUMMARY_MAX_ITEMS", "30"))
+REQUEST_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "30"))
+RETRIES = int(os.getenv("OPENAI_RETRIES", "2"))  # 2 tentativas no total (0 e 1)
+SLEEP_BETWEEN_RETRIES_S = float(os.getenv("OPENAI_RETRY_SLEEP_S", "2"))
 
 
-def _get_from(e: Dict[str, Any]) -> str:
-    return (e.get("from") or e.get("From") or e.get("sender") or "").strip()
+client = OpenAI()
 
 
-def _get_snippet(e: Dict[str, Any]) -> str:
-    return (e.get("snippet") or e.get("Snippet") or e.get("body_preview") or "").strip()
+# =========================
+# Helpers
+# =========================
+def _safe_get(d: Dict[str, Any], key: str, default=None):
+    try:
+        return d.get(key, default)
+    except Exception:
+        return default
 
 
-def _get_date(e: Dict[str, Any]) -> str:
-    # tenta vários campos comuns
-    for k in ("date", "Date", "internalDate", "received_at", "receivedAt"):
-        v = e.get(k)
-        if v:
-            return str(v)
-    return ""
+def _email_to_item(e: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Converte o email (dict vindo do gmail_client.py) para um item consistente.
+    Ajuste os nomes se seu gmail_client usa chaves diferentes.
+    """
+    subject = _safe_get(e, "subject", "") or _safe_get(e, "Subject", "") or ""
+    frm = _safe_get(e, "from", "") or _safe_get(e, "From", "") or ""
+    snippet = _safe_get(e, "snippet", "") or _safe_get(e, "body", "") or ""
+
+    # data pode vir em iso, timestamp, etc — aqui mantemos como string simples
+    date = _safe_get(e, "date", "") or _safe_get(e, "internalDate", "") or ""
+
+    return {
+        "subject": str(subject).strip(),
+        "from": str(frm).strip(),
+        "date": str(date).strip(),
+        "snippet": str(snippet).strip(),
+    }
 
 
 def build_items(emails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Converte a lista de emails em itens mínimos para classificação/resumo."""
+    """
+    Função esperada pelo main.py.
+    """
     items = []
-    for e in emails or []:
-        subj = _get_subject(e)
-        frm = _get_from(e)
-        snip = _get_snippet(e)
-        if not subj and not snip:
-            continue
-        items.append(
-            {
-                "subject": subj,
-                "from": frm,
-                "snippet": snip[:800],  # corta pra não explodir o prompt
-                "date": _get_date(e),
-            }
-        )
+    for e in (emails or [])[:MAX_ITEMS]:
+        items.append(_email_to_item(e))
     return items
 
 
-# ---------------------------
-# Prompt principal
-# ---------------------------
 def _build_prompt(items: List[Dict[str, Any]]) -> str:
+    """
+    Prompt: humanizado + foco em banco/contas/escola/prazos.
+    """
+    lines = []
+    for i, it in enumerate(items, start=1):
+        lines.append(
+            f"{i}) FROM: {it.get('from','')}\n"
+            f"   SUBJECT: {it.get('subject','')}\n"
+            f"   SNIPPET: {it.get('snippet','')}\n"
+        )
+
+    emails_block = "\n".join(lines)
+
     return f"""
-Você é o assistente pessoal do Leandro. Sua tarefa é ler uma lista de emails (apenas assunto, remetente e snippet)
-e devolver uma triagem em 3 níveis com SCORE (0–100), um resumo útil e uma ação prática.
+Você é meu assistente pessoal. Sua missão é me ajudar a NÃO perder prazos e assuntos críticos.
 
-Objetivo do Leandro:
-- O que MAIS importa: banco/contas/pagamentos/boletos, escola (filho), assuntos com prazo/vencimento/renovação,
-  cobranças, faturas, impostos, multas, documentos, reservas/viagens com pagamento, compras com entrega relevante.
-- O que NÃO importa (jogue para BAIXA, score baixo): alertas de infra/devops (Render, Railway, server down, deploy crashed),
-  newsletters genéricas, promoções, marketing, esportes, redes sociais, releases e “FYI”.
+**O que é mais importante para mim (priorize isso):**
+- banco, cartão, cobrança, fatura, parcelas, boletos, pagamentos, fraudes, segurança, imposto
+- contas a vencer (prazo, vencimento, renovação), serviços (internet, telefone, energia, condomínio)
+- escola (mensalidade, reunião, agenda, recados, documentos, matrícula)
+- coisas com data limite / action required / confirmação necessária
 
-Regras de pontuação (importante):
-- 90–100: exige ação real e em breve (vencimento, cobrança, risco de perder serviço, pagamento pendente, escola com prazo, banco pedindo algo).
-- 80–89: importante, mas pode ser resolvido em 1–3 dias (entrega/compra, confirmação de dados de pagamento, alteração de conta).
-- 50–79: relevante, mas sem urgência clara (informativo profissional útil, aviso que pode virar pendência).
-- 0–49: ruído (promo/newsletter/infra alert).
+**O que NÃO quero como prioridade (normalmente BAIXA):**
+- alertas técnicos de sistemas (Render, Railway, GitHub Actions etc.)
+- newsletters, promoções, marketing genérico (a menos que seja cobrança/prazo real)
 
-Estilo do texto:
-- Não escreva como robô.
-- Fale como um assistente humano: direto, útil, com 1–2 frases que realmente expliquem do que se trata.
-- Evite frases vazias tipo “sem sinais fortes de banco...”. Sempre diga o TEMA do email.
+Quero que você produza um resumo em 3 blocos: ALTA, MÉDIA e BAIXA.
+- Dê um score de 0 a 100.
+- Fale num tom humano, como um assistente (nada de "sem sinais fortes de...").
+- Para cada email: diga o tema em 1 linha e uma ação prática curta (se houver).
 
-Saída:
-- Devolva JSON (apenas JSON) com a chave "results": uma lista de objetos, um por email.
-- Cada objeto deve ter:
-  - "score": número inteiro 0–100
-  - "summary": 1–2 frases (o que é e por que importa)
-  - "action": 1 frase com ação sugerida (prática)
-  - "bucket": "ALTA" (>=80) | "MEDIA" (50-79) | "BAIXA" (<50)
+Responda em JSON **válido**, neste formato:
 
-Emails:
-{json.dumps(items, ensure_ascii=False, indent=2)}
+{{
+  "alta": [{{"score": 0, "titulo": "", "resumo": "", "acao": ""}}],
+  "media": [{{"score": 0, "titulo": "", "resumo": "", "acao": ""}}],
+  "baixa": [{{"score": 0, "titulo": "", "resumo": "", "acao": ""}}]
+}}
+
+Aqui estão os emails (mais recentes primeiro):
+
+{emails_block}
 """.strip()
 
 
-def _call_openai(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if OpenAI is None:
-        raise RuntimeError("Biblioteca openai não encontrada. Verifique requirements.txt (openai>=1.0.0).")
+def _call_openai_for_json(prompt: str) -> Dict[str, Any]:
+    """
+    Chama OpenAI pedindo JSON; se vier algo inválido, lança exceção com o raw anexado.
+    """
+    last_err = None
+    for attempt in range(RETRIES):
+        try:
+            resp = client.responses.create(
+                model=MODEL,
+                input=prompt,
+                # pedimos "text" e parseamos nós mesmos (mais compatível)
+                # se preferir, podemos evoluir depois para response_format json_schema
+                timeout=REQUEST_TIMEOUT_S,
+            )
 
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY não definido nas variáveis de ambiente.")
+            # Extrai texto de forma robusta (SDK novo pode variar)
+            text = ""
+            try:
+                text = resp.output_text or ""
+            except Exception:
+                text = ""
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    client = OpenAI(api_key=api_key)
+            raw = (text or "").strip()
 
-    prompt = _build_prompt(items)
+            if not raw:
+                raise ValueError("OpenAI returned empty text (cannot parse JSON)")
 
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "Você classifica emails e sugere ações com precisão."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
+            # às vezes vem cercado por ```json ... ```
+            if raw.startswith("```"):
+                raw = raw.strip("`")
+                raw = raw.replace("json", "", 1).strip()
 
-    content = (resp.choices[0].message.content or "").strip()
-    # tenta parsear JSON “na unha”
-    data = json.loads(content)
-    results = data.get("results", [])
-    if not isinstance(results, list):
-        return []
-    return results
+            # tenta JSON
+            try:
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError("JSON parsed but is not an object")
+                return data
+            except json.JSONDecodeError as je:
+                # Anexa começo do texto pro log
+                preview = raw[:240].replace("\n", "\\n")
+                raise ValueError(f"JSON decode failed. Preview: {preview}") from je
+
+        except Exception as e:
+            last_err = e
+            if attempt < RETRIES - 1:
+                time.sleep(SLEEP_BETWEEN_RETRIES_S)
+                continue
+            raise last_err
 
 
-def _format_telegram(results: List[Dict[str, Any]]) -> str:
-    high = [r for r in results if r.get("bucket") == "ALTA"]
-    mid = [r for r in results if r.get("bucket") == "MEDIA"]
-    low = [r for r in results if r.get("bucket") == "BAIXA"]
+def _format_message(data: Dict[str, Any]) -> str:
+    def _fmt_block(title: str, arr: List[Dict[str, Any]]) -> str:
+        if not arr:
+            return f"{title}\n\n(sem itens)\n"
+        out = [title, ""]
+        for idx, it in enumerate(arr, start=1):
+            score = it.get("score", "")
+            titulo = (it.get("titulo") or "").strip()
+            resumo = (it.get("resumo") or "").strip()
+            acao = (it.get("acao") or "").strip()
 
-    def fmt_group(title: str, group: List[Dict[str, Any]]) -> str:
-        if not group:
-            return ""
-        lines = [f"*{title}*"]
-        for i, r in enumerate(group, 1):
-            score = int(r.get("score", 0))
-            summary = (r.get("summary") or "").strip()
-            action = (r.get("action") or "").strip()
-            lines.append(f"\n{i}) *Score:* {score}\n*Resumo:* {summary}\n*Ação:* {action}")
-        return "\n".join(lines)
+            out.append(f"{idx}) [{score}/100] {titulo}".strip())
+            if resumo:
+                out.append(f"   • {resumo}")
+            if acao:
+                out.append(f"   • Ação: {acao}")
+            out.append("")
+        return "\n".join(out).rstrip() + "\n"
 
-    parts = []
-    parts.append(fmt_group("ALTA (>=80)", high))
-    parts.append(fmt_group("MÉDIA (50–79)", mid))
-    parts.append(fmt_group("BAIXA (<50)", low))
+    alta = data.get("alta") or []
+    media = data.get("media") or []
+    baixa = data.get("baixa") or []
 
-    msg = "\n\n".join([p for p in parts if p.strip()])
-
-    # fallback
-    if not msg.strip():
-        msg = "Nada relevante agora. Se quiser, eu posso revisar de novo mais tarde."
-
-    return msg
+    msg = ""
+    msg += _fmt_block("📌 Emails com prioridade ALTA", alta)
+    msg += "\n" + _fmt_block("🟡 Emails com prioridade MÉDIA", media)
+    msg += "\n" + _fmt_block("⚪ Emails com prioridade BAIXA (ação opcional)", baixa)
+    return msg.strip()
 
 
 def build_summary_from_items(items: List[Dict[str, Any]]) -> str:
-    """Novo fluxo: recebe items e devolve texto pronto para Telegram."""
-    if not items:
-        return ""
+    """
+    Função esperada pelo main.py.
+    Retorna mensagem pronta para Telegram.
+    """
+    prompt = _build_prompt(items)
 
-    results = _call_openai(items)
-
-    # normaliza bucket por segurança
-    for r in results:
-        s = int(r.get("score", 0))
-        if s >= 80:
-            r["bucket"] = "ALTA"
-        elif s >= 50:
-            r["bucket"] = "MEDIA"
-        else:
-            r["bucket"] = "BAIXA"
-
-    return _format_telegram(results)
+    data = _call_openai_for_json(prompt)
+    return _format_message(data)
 
 
-# Compatibilidade com versões antigas do main.py
+# (compatibilidade com versões antigas, se seu main cair aqui)
 def build_summary(emails: List[Dict[str, Any]]) -> str:
     items = build_items(emails)
+    if not items:
+        return ""
     return build_summary_from_items(items)
