@@ -9,6 +9,12 @@ from openai import OpenAI
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_ITEMS = int(os.getenv("SUMMARY_MAX_ITEMS", "30"))
+
+# Novos controles de “poluição” na BAIXA
+LOW_MAX_ITEMS = int(os.getenv("LOW_MAX_ITEMS", "5"))  # quantos itens BAIXA listar no máximo
+LOW_SHOW_ONLY_USEFUL = os.getenv("LOW_SHOW_ONLY_USEFUL", "1") == "1"  # se 1, BAIXA só mostra “úteis”
+LOW_GROUP_REST = os.getenv("LOW_GROUP_REST", "1") == "1"  # se 1, agrupa o resto em uma linha
+
 REQUEST_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "30"))
 RETRIES = int(os.getenv("OPENAI_RETRIES", "2"))
 SLEEP_BETWEEN_RETRIES_S = float(os.getenv("OPENAI_RETRY_SLEEP_S", "2"))
@@ -66,11 +72,18 @@ Você é meu assistente pessoal. Seu trabalho é me ajudar a NÃO perder prazos 
 ### Regras fortes (importante)
 1) Alertas técnicos e TI DEVEM SER BAIXA por padrão:
    - Render, Railway, GitHub, deploy, crash, logs, uptime, API key, billing setup de API/Cloud (Gemini/OpenAI/AWS/GCP), incident, monitoring, SRE, CI/CD.
-   - Só suba para MÉDIA/ALTA se houver risco direto financeiro imediato pessoal (ex.: cobrança real, fatura vencendo, pagamento pendente no cartão).
+   - Só suba para MÉDIA/ALTA se houver risco direto financeiro pessoal (ex.: cobrança real, fatura vencendo, pagamento pendente no cartão).
 2) Newsletters, promoções e convites sociais tendem a BAIXA.
-3) Quero um TOM HUMANO: como um assistente de verdade. Evite frases vazias tipo “sem sinais fortes de...”.
-   - Diga o tema em 1 linha, com um “porquê” curto.
-   - Ação prática objetiva: “pagar até X”, “confirmar se já pagou”, “agendar”, “responder”, “arquivar”.
+
+### Regras para reduzir poluição (BAIXA)
+- Evite listar dezenas de itens irrelevantes.
+- Use o campo "util" para marcar BAIXA que ainda vale a pena mostrar (ex.: confirmação de pagamento, comprovante, recibo, rastreio/entrega, confirmação de reserva).
+- Promoções/newsletters/convites sociais/alertas técnicos normalmente NÃO são "util".
+
+### Tom
+Quero um tom humano. Nada de “sem sinais fortes de…”.
+Diga o tema em 1 linha com um porquê curto.
+Ação prática objetiva.
 
 ### Saída obrigatória
 Responda em JSON válido, exatamente neste formato:
@@ -78,7 +91,7 @@ Responda em JSON válido, exatamente neste formato:
 {{
   "alta": [{{"score": 0, "titulo": "", "resumo": "", "acao": ""}}],
   "media": [{{"score": 0, "titulo": "", "resumo": "", "acao": ""}}],
-  "baixa": [{{"score": 0, "titulo": "", "resumo": "", "acao": ""}}]
+  "baixa": [{{"score": 0, "titulo": "", "resumo": "", "acao": "", "util": false}}]
 }}
 
 ### Critério de score (guia rápido)
@@ -118,14 +131,10 @@ def _call_openai_for_json(prompt: str) -> Dict[str, Any]:
                 raw = raw.strip("`")
                 raw = raw.replace("json", "", 1).strip()
 
-            try:
-                data = json.loads(raw)
-                if not isinstance(data, dict):
-                    raise ValueError("JSON parsed but is not an object")
-                return data
-            except json.JSONDecodeError as je:
-                preview = raw[:240].replace("\n", "\\n")
-                raise ValueError(f"JSON decode failed. Preview: {preview}") from je
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("JSON parsed but is not an object")
+            return data
 
         except Exception as e:
             last_err = e
@@ -135,7 +144,37 @@ def _call_openai_for_json(prompt: str) -> Dict[str, Any]:
             raise last_err
 
 
+def _normalize_list(x) -> List[Dict[str, Any]]:
+    if not x:
+        return []
+    if isinstance(x, list):
+        return [i for i in x if isinstance(i, dict)]
+    return []
+
+
+def _trim_low(low: List[Dict[str, Any]]) -> (List[Dict[str, Any]], int):
+    """
+    - Se LOW_SHOW_ONLY_USEFUL: mantém apenas baixa com util=True
+    - Limita em LOW_MAX_ITEMS
+    - Retorna (lista_final, qtd_agrupada)
+    """
+    original_count = len(low)
+
+    if LOW_SHOW_ONLY_USEFUL:
+        low = [it for it in low if bool(it.get("util"))]
+
+    low = low[: max(0, LOW_MAX_ITEMS)]
+    grouped = max(0, original_count - len(low))
+    return low, grouped
+
+
 def _format_message(data: Dict[str, Any]) -> str:
+    alta = _normalize_list(data.get("alta"))
+    media = _normalize_list(data.get("media"))
+    baixa = _normalize_list(data.get("baixa"))
+
+    baixa_final, baixa_grouped = _trim_low(baixa)
+
     def _fmt_block(title: str, arr: List[Dict[str, Any]]) -> str:
         if not arr:
             return f"{title}\n\n(sem itens)\n"
@@ -154,14 +193,17 @@ def _format_message(data: Dict[str, Any]) -> str:
             out.append("")
         return "\n".join(out).rstrip() + "\n"
 
-    alta = data.get("alta") or []
-    media = data.get("media") or []
-    baixa = data.get("baixa") or []
-
     msg = ""
     msg += _fmt_block("📌 Emails com prioridade ALTA", alta)
     msg += "\n" + _fmt_block("🟡 Emails com prioridade MÉDIA", media)
-    msg += "\n" + _fmt_block("⚪ Emails com prioridade BAIXA (ação opcional)", baixa)
+
+    # BAIXA: só mostra a lista (já filtrada) e opcionalmente um “rodapé” agrupado
+    baixa_title = "⚪ Emails com prioridade BAIXA (ação opcional)"
+    msg += "\n" + _fmt_block(baixa_title, baixa_final)
+
+    if LOW_GROUP_REST and baixa_grouped > 0:
+        msg += f"\n(🧹 Mais {baixa_grouped} emails irrelevantes/promoções foram ignorados pra não poluir.)\n"
+
     return msg.strip()
 
 
